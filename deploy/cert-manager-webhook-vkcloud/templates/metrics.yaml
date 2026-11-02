@@ -1,0 +1,39 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cert-manager-webhook-vkcloud.fullname" . }}-metrics
+  labels:
+    app: {{ include "cert-manager-webhook-vkcloud.name" . }}
+    release: {{ .Release.Name }}
+spec:
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+  selector:
+    app: {{ include "cert-manager-webhook-vkcloud.name" . }}
+    release: {{ .Release.Name }}
+{{- if .Values.metrics.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "cert-manager-webhook-vkcloud.fullname" . }}
+  {{- with .Values.metrics.serviceMonitor.labels }}
+  labels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace | quote }}]
+  selector:
+    matchLabels:
+      app: {{ include "cert-manager-webhook-vkcloud.name" . }}
+      release: {{ .Release.Name }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+{{- end }}
+{{- end }}

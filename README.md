@@ -1,248 +1,187 @@
- # VK Cloud DNS ACME webhook
- 
- **cert-manager-webhook-vkcloud** — это [webhook](https://cert-manager.io/docs/configuration/acme/dns01/#webhook) для [cert-manager](https://cert-manager.io), предназначенный для автоматической проверки доменов через DNS REST API **VK Cloud**. 
+# VK Cloud DNS webhook for cert-manager
 
- Этот webhook позволяет выписывать TLS-сертификаты через Let's Encrypt (или другой ACME провайдер), используя DNS-01 challenge и автоматически создавая TXT-записи в зоне VK Cloud DNS.
+Version **0.3.0**. Maintained fork of
+[drone076/cert-manager-webhook-vkcloud](https://github.com/drone076/cert-manager-webhook-vkcloud).
 
- ## Почему standalone?
+This DNS01 solver creates and removes ACME challenge TXT records through the
+VK Cloud Public DNS API. cert-manager handles ACME orders, DNS propagation checks,
+certificate issuance, and renewal. This webhook does not read or write Vault.
 
- В отличие от большинства решений, которые требуют зависимости от [`jetstack/cert-manager`](https://github.com/jetstack/cert-manager) и настройки авторизации, этот webhook может быть установлен **без зависимости от jetstack**, как самостоятельный компонент. Это удобно, если:
+## Requirements
 
- - Вы хотите минимизировать количество зависимостей.
- - У вас уже установлен cert-manager и вы просто добавляете новый DNS-провайдер.
- - Вы работаете в частной Kubernetes-среде и предпочитаете минимальные инсталляции.
+- Go 1.26 for building or testing the source.
+- cert-manager installed in Kubernetes before installing this chart. Dependencies
+  are aligned with cert-manager v1.21.3 and Kubernetes Go modules v0.36.2.
+- A public DNS zone delegated to VK Cloud, and credentials with access to read
+  zones and read/create/delete TXT records in its project.
+- A container registry accessible to Kubernetes nodes.
 
- ## Возможности
+## Build the image
 
- - Поддержка DNS-01 challenge через REST API VK Cloud
- - Простая интеграция с cert-manager
- - Поддержка нескольких доменов
- - Совместимость с Let's Encrypt и другими ACME-провайдерами
-
- ---
-
- ## Требования
-
- - Kubernetes 1.16+
- - cert-manager v1.6+ (установлен отдельно)
- - Доступ к VK Cloud (логин, пароль, ID проекта, домен)
-
- ---
-
- ## Установка
-
- ### 1. Установите cert-manager (если еще не установлен)
-
- Инструкция:  
- [https://cert-manager.io/docs/installation/](https://cert-manager.io/docs/installation/) 
-
- ### 2. Клонируйте репозиторий
-
- ```bash
- git clone https://github.com/drone076/cert-manager-webhook-vkcloud.git 
- cd cert-manager-webhook-vkcloud
- ```
-
- ### 3. Установите webhook с помощью Helm
-
- ```bash
- helm install -n cert-manager-webhook-vkcloud ./deploy/cert-manager-webhook-vkcloud --namespace cert-manager -f ./deploy/cert-manager-webhook-vkcloud/values.yaml
- ```
-
- > Обратите внимание: webhook будет запущен как Deployment и зарегистрирован в cert-manager по имени `groupName`, указанному в `values.yaml` (через переменную окружения `GROUP_NAME`, например: `acme.cloud.vk.com`).
-
-### 4. Удаление с помощью Helm
+Set your actual Docker registry endpoint. This repository does not assume that a
+public image is published. The Helm default image repository is a placeholder.
 
 ```bash
-helm uninstall -n cert-manager cert-manager-webhook-vkcloud
+export WEBHOOK_IMAGE=registry.example.com/infra/cert-manager-webhook-vkcloud:0.3.0
+docker login registry.example.com
+docker buildx build --platform linux/amd64 --tag "$WEBHOOK_IMAGE" --push .
 ```
 
----
+Use linux/arm64 or a multi-platform build for ARM nodes. The final image is
+non-root, contains a statically linked binary, and loads credentials at runtime.
+The embedded image label is cert-manager-webhook-vkcloud:0.3.0.
 
- ## Настройка
+## Install the chart
 
- ### 1. Создайте секрет с учетными данными VK Cloud
+Replace the placeholder registry with the repository used above:
 
- Сохраните файл `vkcloud-secret.yaml`:
+```bash
+helm upgrade --install vkcloud-webhook deploy/cert-manager-webhook-vkcloud \
+  --namespace cert-manager --create-namespace \
+  --set-string image.repository=registry.example.com/infra/cert-manager-webhook-vkcloud \
+  --set-string image.tag=0.3.0 \
+  --wait --timeout 10m
+```
 
- ```yaml
- apiVersion: v1
- kind: Secret
- metadata:
-   name: vkcloud-secret
-   namespace: cert-manager
- type: Opaque
- stringData:
-   os_auth_url: "https://infra.mail.ru:35357/v3/auth/tokens" 
-   os_username: "<ваш_логин>"
-   os_password: "<ваш_пароль>"
-   os_project_id: "<ID_проекта>"
-   os_domain_name: "users"
- ```
+The chart installs Deployment, Service, ServiceAccount/RBAC, APIService, and
+Issuer/Certificate resources for serving TLS. The process listens on HTTPS 8443,
+behind a Service on 443. Names are stable across release names by default;
+change fullnameOverride if intentionally deploying another instance.
+For a private registry, set imagePullSecrets to a list of Kubernetes Secret names.
 
- Примените его:
+## Configure credentials and ACME
 
- ```bash
- kubectl apply -f vkcloud-secret.yaml
- ```
+The files under data/ are examples. Replace all placeholders and example.com with
+a domain you control. Do not commit real credentials.
 
- ### 2. Пример ClusterIssuer
+1. Provision the credential Secret using your existing secret management workflow;
+   data/vkcloud-secret.yaml describes the expected fields.
+2. Apply data/clusterissuer.yaml after replacing the email and DNS zone.
+3. Apply data/certificate.yaml to request both the ordinary name and wildcard.
 
- Создайте `clusterissuer.yaml`:
+The Secret is named vkcloud-dns-credentials by default. It must match
+credentialsSecretName in chart values and secretRef.name in the Issuer.
+Credentials are read from the Issuer resource namespace. A reference to another
+namespace is rejected. For ClusterIssuer, cert-manager normally uses namespace
+cert-manager; adjust its cluster resource namespace and the webhook configuration
+consistently if using a different setup. RBAC grants get only on that one Secret.
 
- ```yaml
- apiVersion: cert-manager.io/v1
- kind: ClusterIssuer
- metadata:
-   name: sampleclusterissuer
- spec:
-   acme:
-     email: your@email.com
-     privateKeySecretRef:
-       name: letsencrypt
-     server: https://acme-v02.api.letsencrypt.org/directory 
-     solvers:
-       - dns01:
-           webhook:
-             groupName: acme.cloud.vk.com
-             solverName: cert-manager-webhook-vkcloud
-             config:
-               secretRef:
-                 name: vkcloud-secret
-                 namespace: cert-manager
-        # Добавьте по желанию выбор доменов в этом блоке, если его нет, солвер будет использован по-умолчанию
-        selector:
-          dnsNames:
-          - example.com
-          ...
- ```
+| Secret field | Required | Description |
+| --- | --- | --- |
+| os_username | Yes | VK Cloud username, typically a dedicated service account |
+| os_password | Yes | Account password |
+| os_project_id | Yes | Keystone project ID that owns the public DNS zone |
+| os_auth_url | No | Identity v3 URL; defaults to https://msk.cloud.vk.ru/infra/identity/v3/ |
+| os_domain_name | No | User domain name; default users, typically service-users for service accounts |
+| os_domain_id | No | User domain ID; takes precedence over os_domain_name |
 
- Примените:
+Auth URLs may end with /v3/ or /v3/auth/tokens. The client adds /auth/tokens when
+needed. The DNS project can differ from the Kubernetes cluster project.
 
- ```bash
- kubectl apply -f clusterissuer.yaml
- ```
+Issuer solver configuration:
 
- ### 3. Пример Certificate
+```yaml
+dns01:
+  webhook:
+    groupName: acme.example.com
+    solverName: cert-manager-webhook-vkcloud
+    config:
+      secretRef:
+        name: vkcloud-dns-credentials
+      region: RegionOne
+      # zoneID: YOUR_ZONE_UUID
+      # dnsAPIURL: https://actual-endpoint/public-dns/v2
+```
 
- ```yaml
- apiVersion: cert-manager.io/v1
- kind: Certificate
- metadata:
-   name: example.com-tls
-   namespace: default
- spec:
-   secretName: example.com-tls
-   issuerRef:
-     name: sampleclusterissuer
-     kind: ClusterIssuer
-   dnsNames:
-     - example.com
- ```
+The chart groupName, GROUP_NAME environment variable, APIService, and Issuer
+webhook.groupName must agree. Choose a group name under a domain you control.
 
- ---
+The client obtains the publicdns endpoint for the configured region from the
+Keystone service catalog. An explicit dnsAPIURL overrides discovery and must
+include the v2 base path without /dns/. A configured zoneID bypasses zone listing;
+otherwise the client matches the zone by its resolved name.
 
- ## Как это работает
+Start with Let's Encrypt staging, as shown in the examples. After validating
+issuance, TXT cleanup, and renewal, configure the production ACME URL and a
+separate account Secret. Staging certificates are not browser-trusted.
 
- 1. cert-manager вызывает webhook, указанный в `ClusterIssuer`.
- 2. Webhook аутентифицируется в VK Cloud через API.
- 3. Получает список DNS-зон и находит нужную.
- 4. Создает временную TXT-запись для подтверждения владения доменом.
- 5. После успешной проверки, сертификат выдается.
- 6. TXT-запись удаляется после завершения проверки.
+## DNS record lifecycle
 
- ---
+- Present normalizes the FQDN into a name relative to its DNS zone and checks
+  existing records by both name and TXT value before creating.
+- CleanUp removes only matching records. Other values at the same name are kept;
+  an already missing record or HTTP 404 during deletion is successful cleanup.
+- The client accepts TXT list responses as either an array or a txt_records object.
+- TXT records are created with TTL 60 seconds. cert-manager checks propagation.
+- GET and DELETE retry transport failures and HTTP 429/500/502/503/504. Retries
+  use exponential backoff with jitter and honour Retry-After up to 30 seconds.
+- POST is not retried blindly. If creation succeeds but the response is lost,
+  the next cert-manager reconciliation reads existing records before creating.
 
- ## Отладка
+## Logging and runtime settings
 
- Смотрите clusterissuer, orders, challenge, cert для соответствующих namespace, например в k9s.
+Application logs use JSON. The chart also enables JSON logging for the embedded
+cert-manager API server. Lifecycle events include client creation, authentication,
+endpoint/zone selection, record creation/deletion, completion, retries, and errors.
+Passwords, authentication tokens, TXT values, and response bodies are not logged.
 
- ## Поддерживаемые версии cert-manager
+| Helm value | Environment variable | Default |
+| --- | --- | --- |
+| logging.level | LOG_LEVEL | info |
+| runtime.httpTimeout | HTTP_TIMEOUT | 30s |
+| runtime.operationTimeout | OPERATION_TIMEOUT | 2m |
+| runtime.retryMaxAttempts | RETRY_MAX_ATTEMPTS | 3 |
+| runtime.retryInitialDelay | RETRY_INITIAL_DELAY | 1s |
+| metrics.enabled / metrics.port | METRICS_ADDRESS | :9402 |
 
- - ✅ cert-manager v1.6+
- - ✅ cert-manager v1.17.2 (рекомендуемая)
+Use debug for HTTP method/status/attempt/duration logs. Valid levels are debug,
+info, warn, and error. retryMaxAttempts includes the initial attempt; 1 disables
+retries, and the accepted range is 1 through 10. Durations must be positive.
+An empty METRICS_ADDRESS disables the metrics listener.
 
- ---
+## Prometheus and VictoriaMetrics
 
- ## Примеры конфигураций
+Metrics are enabled at HTTP :9402/metrics on a separate ClusterIP Service.
+ServiceMonitor creation is **disabled by default** because its CRD is optional.
+Enable metrics.serviceMonitor.enabled only when the Prometheus Operator CRD exists,
+and set metrics.serviceMonitor.labels to match your Prometheus selector.
 
- ### `vkcloud-secret.yaml`
+Native VictoriaMetrics VMPodScrape can select the webhook pods using the app label
+cert-manager-webhook-vkcloud and the named port metrics. Avoid scraping the same
+endpoint through both native discovery and a converted ServiceMonitor.
 
- ```yaml
- apiVersion: v1
- kind: Secret
- metadata:
-   name: vkcloud-secret
-   namespace: cert-manager
- type: Opaque
- stringData:
-   os_auth_url: "https://infra.mail.ru:35357/v3/auth/tokens" 
-   os_username: "<ваш_логин>"
-   os_password: "<ваш_пароль>"
-   os_project_id: "<ID_проекта>"
-   os_domain_name: "users"
- ```
+| Metric | Labels | Description |
+| --- | --- | --- |
+| vkcloud_webhook_operations_total | operation, result | Completed present/cleanup operations |
+| vkcloud_webhook_operation_duration_seconds | operation, result | Operation duration histogram |
+| vkcloud_webhook_http_requests_total | method, status | API attempts; status 0 means a transport failure |
+| vkcloud_webhook_http_retries_total | method | Retries of safe API requests |
 
- ### `clusterissuer.yaml`
+Go runtime and process metrics are also exposed. Labels do not contain domains,
+TXT values, account names, or credentials.
 
- ```yaml
- apiVersion: cert-manager.io/v1
- kind: ClusterIssuer
- metadata:
-   name: sampleclusterissuer
- spec:
-   acme:
-     email: your@email.com
-     privateKeySecretRef:
-       name: letsencrypt
-     server: https://acme-v02.api.letsencrypt.org/directory 
-     solvers:
-       - dns01:
-           webhook:
-             groupName: acme.cloud.vk.com
-             solverName: cert-manager-webhook-vkcloud
-             config:
-               secretRef:
-                 name: vkcloud-secret
-                 namespace: cert-manager
- ```
+## Verify and troubleshoot
 
- ---
+```bash
+go test -race ./...
+go vet ./...
+helm lint deploy/cert-manager-webhook-vkcloud
+kubectl -n cert-manager logs deployment/cert-manager-webhook-vkcloud --since=10m
+kubectl -n cert-manager get certificate,certificaterequest,order,challenge
+kubectl get apiservice v1alpha1.acme.example.com
+```
 
- ## FAQ
+An APIService should report Available=True. A successful Present only means that
+the provider accepted the record; DNS propagation and ACME authorization follow.
+Check TXT publication on the authoritative nameservers if a Challenge remains
+pending. Check user domain, DNS project ID, region, and permissions for HTTP 401/403.
+A missing publicdns catalog endpoint can be handled with an explicit dnsAPIURL.
 
- ### Почему нет зависимости от Jetstack?
+Tests cover authentication/domain mapping, TXT normalization, repeat-safe creation
+and cleanup, retries, cancellation, lost create responses, JSON log redaction,
+metrics exposition, and invalid runtime options. Live VK DNS and ACME staging
+verification is still required for a new cloud/project configuration.
 
- Webhook написан так, чтобы работать автономно — он сам реализует необходимый интерфейс для cert-manager, и вам не нужно устанавливать дополнительных CRD или контроллеров. Использование внешнего хука сильно усложняет настройку RBAC, или даже вообще делает ее невозможной вызывая ошибки с ***system:anonymous***
+## License
 
- ### Нужен ли Docker?
-
- Да, но образ уже собран и доступен на Docker Hub / GitLab. Вы также можете собрать свой, если потребуется кастомизация.
-
-> Рекомендуется фиксировать версию образа (например, `tag: 1.0.9`) вместо `latest`, и использовать `pullPolicy: IfNotPresent`, чтобы избежать непредсказуемых обновлений и лишних pulls при каждом перезапуске пода.
-
- ### Что делать, если домен не находится?
-
- Убедитесь, что у пользователя в VK Cloud есть права на чтение и изменение DNS-зон, и что домен добавлен в аккаунте. Смотрите ошибки в challenge.
-
- ---
-
- ## Лицензия
-
-GNU General Public License v3.0 — смотрите [LICENSE](LICENSE)
-
- ---
-
- ## Автор
-
- [drone076](https://github.com/drone076) 
-
- ---
-
- ## Ссылки
-
- - [VK Cloud Public DNS API](https://cloud.vk.com/docs/ru/networks/dns/publicdns) 
- - [cert-manager docs](https://cert-manager.io/docs/) 
- - [Helm docs](https://v2.helm.sh/docs/using_helm/) 
-
- - [Имидж на DockerHub](https://hub.docker.com/r/drone076/cert-manager-webhook-vkcloud)
+GPL-3.0, inherited from upstream. See LICENSE.

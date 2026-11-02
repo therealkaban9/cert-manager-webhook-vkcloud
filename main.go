@@ -1,20 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"io"
-	"net/http"
+	"log/slog"
 	"os"
-	"strings"
 	"time"
 
 	acme "github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
-
 	corev1 "k8s.io/api/core/v1"
 	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,348 +17,105 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-const dnsAPIBaseURL = "https://mcs.mail.ru/public-dns/v2/dns/"
-
-var GroupName = os.Getenv("GROUP_NAME")
-
-var (
-	// These flags are required by cert-manager for TLS
-	tlsCertFile       = flag.String("tls-cert-file", "", "Path to the TLS certificate file")
-	tlsPrivateKeyFile = flag.String("tls-private-key-file", "", "Path to the TLS private key file")
-)
-
 func main() {
-	flag.Parse()
-
-	if GroupName == "" {
+	level := new(slog.LevelVar)
+	if err := level.UnmarshalText([]byte(envOr("LOG_LEVEL", "info"))); err != nil {
+		panic(err)
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+	if err := validateRuntimeOptions(); err != nil {
+		slog.Error("invalid_runtime_options", "error", err)
+		os.Exit(1)
+	}
+	stop, err := startMetricsServer(envOr("METRICS_ADDRESS", ":9402"))
+	if err != nil {
+		slog.Error("metrics_start_failed", "error", err)
+		os.Exit(1)
+	}
+	defer stop()
+	slog.Info("webhook_starting", "version", "0.3.0", "metrics_address", envOr("METRICS_ADDRESS", ":9402"))
+	group := os.Getenv("GROUP_NAME")
+	if group == "" {
 		panic("GROUP_NAME must be specified")
 	}
-
-	cmd.RunWebhookServer(GroupName, &vkcloudDNSSolver{})
+	cmd.RunWebhookServer(group, &vkcloudDNSSolver{})
 }
 
-// vkcloudDNSSolver implements the cert-manager Solver interface for VK Cloud DNS
-type vkcloudDNSSolver struct {
-	client *kubernetes.Clientset
-}
-
-// vkcloudDNSConfig is passed by cert-manager during challenge
+type vkcloudDNSSolver struct{ client kubernetes.Interface }
 type vkcloudDNSConfig struct {
 	SecretRef corev1.SecretReference `json:"secretRef"`
-	Domain    string                 `json:"domain,omitempty"`
+	Region    string                 `json:"region,omitempty"`
+	DNSAPIURL string                 `json:"dnsAPIURL,omitempty"`
+	ZoneID    string                 `json:"zoneID,omitempty"`
 }
 
-// Name returns solver name
-func (c *vkcloudDNSSolver) Name() string {
-	return "cert-manager-webhook-vkcloud"
+func (s *vkcloudDNSSolver) Name() string { return "cert-manager-webhook-vkcloud" }
+func (s *vkcloudDNSSolver) Initialize(cfg *rest.Config, stopCh <-chan struct{}) error {
+	client, err := kubernetes.NewForConfig(cfg)
+	s.client = client
+	return err
 }
-
-// Present creates a TXT record for ACME challenge
-func (c *vkcloudDNSSolver) Present(ch *acme.ChallengeRequest) error {
-	cfg, err := loadConfig(ch.Config)
-	if err != nil {
-		return err
+func loadConfig(raw *extapi.JSON) (vkcloudDNSConfig, error) {
+	cfg := vkcloudDNSConfig{Region: "RegionOne"}
+	if raw == nil {
+		return cfg, fmt.Errorf("solver config is required")
 	}
-
-	authToken, err := authenticate(c.client, ch.ResourceNamespace, cfg.SecretRef)
-	if err != nil {
-		return fmt.Errorf("failed to authenticate to VK Cloud: %w", err)
+	if err := json.Unmarshal(raw.Raw, &cfg); err != nil {
+		return cfg, err
 	}
-
-	dnsZoneID, err := getZoneID(ch.ResolvedZone, authToken)
-	if err != nil {
-		return fmt.Errorf("failed to find zone ID: %w", err)
-	}
-
-	err = createTXTRecord(dnsZoneID, ch.ResolvedFQDN, ch.Key, authToken)
-	if err != nil {
-		return fmt.Errorf("failed to create TXT record: %w", err)
-	}
-
-	return nil
-}
-
-// CleanUp deletes the TXT record after validation
-func (c *vkcloudDNSSolver) CleanUp(ch *acme.ChallengeRequest) error {
-	cfg, err := loadConfig(ch.Config)
-	if err != nil {
-		return fmt.Errorf("error decoding solver config: %w", err)
-	}
-
-	authToken, err := authenticate(c.client, ch.ResourceNamespace, cfg.SecretRef)
-	if err != nil {
-		return err
-	}
-
-	dnsZoneID, err := getZoneID(ch.ResolvedZone, authToken)
-	if err != nil {
-		return err
-	}
-
-	err = deleteTXTRecord(dnsZoneID, ch.ResolvedFQDN, ch.Key, authToken)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// Initialize sets up Kubernetes client
-func (c *vkcloudDNSSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
-	cl, err := kubernetes.NewForConfig(kubeClientConfig)
-	if err != nil {
-		return err
-	}
-	c.client = cl
-	return nil
-}
-
-// loadConfig decodes JSON configuration into our struct
-func loadConfig(cfgJSON *extapi.JSON) (vkcloudDNSConfig, error) {
-	cfg := vkcloudDNSConfig{}
-	if cfgJSON == nil {
-		return cfg, nil
-	}
-	if err := json.Unmarshal(cfgJSON.Raw, &cfg); err != nil {
-		return cfg, fmt.Errorf("error decoding solver config: %w", err)
+	if cfg.SecretRef.Name == "" {
+		return cfg, fmt.Errorf("secretRef.name is required")
 	}
 	return cfg, nil
 }
-
-// authenticate gets X-Subject-Token
-func authenticate(clientset *kubernetes.Clientset, namespace string, secretRef corev1.SecretReference) (string, error) {
-	secret, err := clientset.CoreV1().Secrets(namespace).Get(context.TODO(), secretRef.Name, metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch secret %q: %w", secretRef.Name, err)
+func (s *vkcloudDNSSolver) solve(ch *acme.ChallengeRequest, cleanup bool) (result error) {
+	operation := "present"
+	if cleanup {
+		operation = "cleanup"
 	}
-
-	osAuthURL := string(secret.Data["os_auth_url"])
-	osUsername := string(secret.Data["os_username"])
-	osPassword := string(secret.Data["os_password"])
-	osProjectID := string(secret.Data["os_project_id"])
-	osDomainName := string(secret.Data["os_domain_name"])
-
-	body := map[string]any{
-		"auth": map[string]any{
-			"identity": map[string]any{
-				"methods": []string{"password"},
-				"password": map[string]any{
-					"user": map[string]any{
-						"name":     osUsername,
-						"password": osPassword,
-						"domain": map[string]string{
-							"id": osDomainName,
-						},
-					},
-				},
-			},
-			"scope": map[string]any{
-				"project": map[string]string{
-					"id": osProjectID,
-				},
-			},
-		},
-	}
-
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal JSON: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", osAuthURL, bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create authentication request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("authentication failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", fmt.Errorf("authentication failed with status %d: failed to read response body: %w", resp.StatusCode, err)
+	logger := slog.Default().With("operation", operation, "domain", ch.DNSName, "namespace", ch.ResourceNamespace)
+	started := time.Now()
+	logger.Info("challenge_started")
+	defer func() {
+		outcome := "success"
+		if result != nil {
+			outcome = "error"
+			logger.Error("challenge_failed", "error", result)
+		} else {
+			logger.Info("challenge_completed")
 		}
-		return "", fmt.Errorf("authentication failed with status %d: %s", resp.StatusCode, body)
-	}
+		metrics.operations.WithLabelValues(operation, outcome).Inc()
+		metrics.duration.WithLabelValues(operation, outcome).Observe(time.Since(started).Seconds())
+	}()
 
-	token := resp.Header.Get("X-Subject-Token")
-	if token == "" {
-		return "", fmt.Errorf("no auth token received from VK Cloud")
-	}
-
-	return token, nil
-}
-
-// getZoneID finds zone UUID by domain name
-func getZoneID(zone string, token string) (string, error) {
-	url := dnsAPIBaseURL
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create zones request: %w", err)
-	}
-	req.Header.Set("X-Auth-Token", token)
-
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch zones: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", fmt.Errorf("failed to fetch zones with status %d: failed to read response body: %w", resp.StatusCode, err)
-		}
-		return "", fmt.Errorf("failed to fetch zones with status %d: %s", resp.StatusCode, body)
-	}
-
-	var zones []struct {
-		UUID string `json:"uuid"`
-		Name string `json:"zone"`
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read zones response body: %w", err)
-	}
-	if err := json.Unmarshal(body, &zones); err != nil {
-		return "", fmt.Errorf("failed to parse zones response: %w", err)
-	}
-
-	for _, z := range zones {
-		if strings.TrimSuffix(z.Name, ".") == strings.TrimSuffix(zone, ".") {
-			return z.UUID, nil
-		}
-	}
-
-	return "", fmt.Errorf("zone not found for domain %s", zone)
-}
-
-// createTXTRecord adds a TXT record under the zone
-func createTXTRecord(zoneID, fqdn, key, token string) error {
-	record := map[string]any{
-		"name":    fqdn,
-		"content": key,
-		"ttl":     60,
-	}
-
-	zoneTXTRecordsURL := dnsAPIBaseURL + "%s/txt/"
-	url := fmt.Sprintf(zoneTXTRecordsURL, zoneID)
-	jsonBody, err := json.Marshal(record)
-	if err != nil {
-		return fmt.Errorf("failed to marshal TXT record: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonBody))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-	req.Header.Set("X-Auth-Token", token)
-	req.Header.Set("Content-Type", "application/json")
-
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to create TXT record: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("create failed with status %d: failed to read response body: %w", resp.StatusCode, err)
-		}
-		return fmt.Errorf("create failed with status %d: %s", resp.StatusCode, body)
-	}
-
-	return nil
-}
-
-// deleteTXTRecord removes the specific TXT record
-func deleteTXTRecord(zoneID, fqdn, key, token string) error {
-	zoneTXTRecordsURL := dnsAPIBaseURL + "%s/txt/"
-	url := fmt.Sprintf(zoneTXTRecordsURL, zoneID)
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create list TXT records request: %w", err)
-	}
-	req.Header.Set("X-Auth-Token", token)
-	req.Header.Set("Content-Type", "application/json")
-
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	resp, err := httpClient.Do(req)
+	cfg, err := loadConfig(ch.Config)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to list TXT records with status %d: failed to read response body: %w", resp.StatusCode, err)
-		}
-		return fmt.Errorf("failed to list TXT records with status %d: %s", resp.StatusCode, body)
+	// Credentials must belong to the issuer's resource namespace.
+	if cfg.SecretRef.Namespace != "" && cfg.SecretRef.Namespace != ch.ResourceNamespace {
+		return fmt.Errorf("cross-namespace credential reference is forbidden")
 	}
-
-	var recordsResponse struct {
-		TXTRecords []struct {
-			UUID    string `json:"uuid"`
-			Name    string `json:"name"`
-			Content string `json:"content"`
-		} `json:"txt_records"`
-	}
-
-	body, err := io.ReadAll(resp.Body)
+	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), loggerContextKey{}, logger), durationEnv("OPERATION_TIMEOUT", operationTimeout))
+	defer cancel()
+	logger.Debug("credentials_read", "secret_name", cfg.SecretRef.Name)
+	secret, err := s.client.CoreV1().Secrets(ch.ResourceNamespace).Get(ctx, cfg.SecretRef.Name, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to read TXT records response body: %w", err)
+		return fmt.Errorf("read credentials: %w", err)
 	}
-	if err := json.Unmarshal(body, &recordsResponse); err != nil {
-		return fmt.Errorf("failed to parse TXT records: %w", err)
+	client, err := newDNSClient(ctx, secret.Data, cfg)
+	if err != nil {
+		return err
 	}
-
-	var deleteErrors []string
-
-	for _, r := range recordsResponse.TXTRecords {
-		if r.Name == fqdn && r.Content == key {
-			zoneTXTRecordsURL := dnsAPIBaseURL + "%s/txt/%s"
-			deleteURL := fmt.Sprintf(zoneTXTRecordsURL, zoneID, r.UUID)
-
-			delReq, err := http.NewRequest("DELETE", deleteURL, nil)
-			if err != nil {
-				deleteErrors = append(deleteErrors, fmt.Sprintf("failed to create delete request for TXT record %q: %v", r.UUID, err))
-				continue
-			}
-			delReq.Header.Set("X-Auth-Token", token)
-
-			resp, err := httpClient.Do(delReq)
-			if err != nil {
-				deleteErrors = append(deleteErrors, fmt.Sprintf("failed to delete TXT record %q: %v", r.UUID, err))
-				continue
-			}
-			resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-				deleteErrors = append(deleteErrors, fmt.Sprintf(
-					"failed to delete TXT record %q: unexpected status code %d",
-					r.UUID,
-					resp.StatusCode,
-				))
-			}
-		}
+	zone, err := client.zone(ctx, ch.ResolvedZone, cfg.ZoneID)
+	if err != nil {
+		return err
 	}
-
-	if len(deleteErrors) > 0 {
-		return fmt.Errorf("one or more TXT records failed to delete:\n%s", strings.Join(deleteErrors, "\n"))
+	name, err := relativeName(ch.ResolvedFQDN, ch.ResolvedZone)
+	if err != nil {
+		return err
 	}
-
-	return nil
+	return client.reconcileTXT(ctx, zone, name, ch.Key, cleanup)
 }
+func (s *vkcloudDNSSolver) Present(ch *acme.ChallengeRequest) error { return s.solve(ch, false) }
+func (s *vkcloudDNSSolver) CleanUp(ch *acme.ChallengeRequest) error { return s.solve(ch, true) }

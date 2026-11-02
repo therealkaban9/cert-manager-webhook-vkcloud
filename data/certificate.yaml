@@ -1,0 +1,17 @@
+# Replace example.com with a domain you control.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: example-com
+  namespace: cert-manager
+spec:
+  secretName: example-com-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: vkcloud-letsencrypt-staging
+  dnsNames:
+    - example.com
+    - "*.example.com"
+  renewBeforePercentage: 33
+  privateKey:
+    rotationPolicy: Always

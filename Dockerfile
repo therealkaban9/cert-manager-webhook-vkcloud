@@ -1,28 +1,13 @@
-FROM golang:1.24.4-alpine3.22 AS build_deps
-
-RUN apk add --no-cache git
-
-WORKDIR /workspace
-ENV GO111MODULE=on
-
-COPY go.mod .
-COPY go.sum .
-
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
 RUN go mod download
-
-FROM build_deps AS build
-
-ENV GOOS=linux
-ENV GOARCH=amd64
-
 COPY . .
-
-RUN CGO_ENABLED=0 go build -o webhook -ldflags '-w -extldflags "-static"' .
-
-FROM alpine:3.22
-
-RUN apk add --no-cache ca-certificates
-
-COPY --from=build /workspace/webhook /usr/local/bin/webhook
-
-ENTRYPOINT ["webhook"]
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /webhook .
+FROM gcr.io/distroless/static-debian12:nonroot
+LABEL version="cert-manager-webhook-vkcloud:0.3.0"
+COPY --from=build /webhook /webhook
+USER 65532:65532
+ENTRYPOINT ["/webhook"]
